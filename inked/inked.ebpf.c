@@ -8,6 +8,17 @@
 #include <linux/bpf.h>
 #include <linux/sched.h>
 
+#ifndef SIZE_B
+#define SIZE_B 6500
+#endif
+
+#ifndef TIME_NS
+#define TIME_NS 1000000000
+#endif
+
+#define INCOMING 0
+#define OUTGOING 1
+
 struct fid
 {
   u32 address;
@@ -19,6 +30,7 @@ struct flowStat
 {
   u32 size;
   u64 arrival;
+  u8 dir;
 };
 
 struct data_out
@@ -39,11 +51,11 @@ struct data_out
 #define DEFAULT_HASH_SIZE 10240
 
 BPF_RINGBUF_OUTPUT(output, 1);
-BPF_HASH("lru_hash", struct fid, struct flowStat, flowStats, DEFAULT_HASH_SIZE);
-BPF_HASH("lru_hash", u16, struct fid, inPorts, DEFAULT_HASH_SIZE);
-BPF_HASH("lru_hash", u32, struct fid, pids, DEFAULT_HASH_SIZE);
-BPF_HASH("lru_hash", u16, struct fid, outPorts, DEFAULT_HASH_SIZE);
-BPF_HASH("lru_hash", u32, struct sock*, currSock, DEFAULT_HASH_SIZE);
+BPF_TABLE("lru_hash", struct fid, struct flowStat, flowStats, DEFAULT_HASH_SIZE);
+BPF_TABLE("lru_hash", u16, struct fid, socketIn, DEFAULT_HASH_SIZE);
+BPF_TABLE("lru_hash", u32, struct fid, tgids, DEFAULT_HASH_SIZE);
+BPF_TABLE("lru_hash", u16, struct fid, socketOut, DEFAULT_HASH_SIZE);
+BPF_TABLE("lru_hash", u32, struct sock*, currSock, DEFAULT_HASH_SIZE);
 
 /*
  PROCESS TRACING
@@ -54,11 +66,13 @@ int kretprobe____x64_sys_execve(struct pt_regs *ctx)
   struct fid *fid;
 
   u32 pid = bpf_get_current_pid_tgid() >> 32;
+  task = (struct task_struct *)bpf_get_current_task();
+  u32 ppid = task->real_parent->tgid;
 
-  fid = pids.lookup(&pid);
+  fid = tgids.lookup(&ppid);
   if (fid != 0)
   {
-    pids.update(&pid, fid);
+    tgids.update(&pid, fid);
   }
 
   return 0;
@@ -66,17 +80,22 @@ int kretprobe____x64_sys_execve(struct pt_regs *ctx)
 
 int kretprobe____x64_sys_clone(struct pt_regs *ctx)
 {
+  struct task_struct *task;
+  struct fid *fid;
+
+  task = (struct task_struct *)bpf_get_current_task();
+  u32 ppid = task->parent->tgid;
+
   u32 child_pid = PT_REGS_RC(ctx);
   if (child_pid <= 0)
   {
     return 1;
   }
 
-  u32 pid = bpf_get_current_pid_tgid() >> 32;
-  struct fid *fid = pids.lookup(&pid);
+  fid = tgids.lookup(&ppid);
   if (fid != 0)
   {
-    pids.update(&child_pid, fid);
+    tgids.update(&child_pid, fid);
   }
 
   return 0;
@@ -90,7 +109,7 @@ TRACEPOINT_PROBE(sched, sched_process_exit)
   {
     u32 pid = task->tgid;
     if (pid != 0)
-      pids.delete(&pid);
+      tgids.delete(&pid);
   }
   return 0;
 }
@@ -111,10 +130,10 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
 
   struct fid *fid;
 
-  fid = inPorts.lookup(&dport);
+  fid = socketIn.lookup(&dport);
   if (fid != 0 && pid != 0)
   {
-    pids.update(&pid, fid);
+    tgids.update(&pid, fid);
   }
 
   return 0;
@@ -156,10 +175,10 @@ int kretprobe__inet_hash_connect(struct pt_regs *ctx)
 
   struct fid *fid;
 
-  fid = pids.lookup(&pid);
+  fid = tgids.lookup(&pid);
   if (fid != 0)
   {
-    outPorts.update(&sport, fid);
+    socketOut.update(&sport, fid);
   }
 
   currSock.delete(&pid);
@@ -211,18 +230,19 @@ int handle_ingress(struct xdp_md *ctx)
       struct flowStat newStat;
       newStat.size = bpf_ntohs(iph->tot_len);
       newStat.arrival = bpf_ktime_get_ns();
+      newStat.dir = INCOMING;
       flowStats.insert(&fid, &newStat);
+
+      u16 tcp_src = ntohs(tcph->source);
+
+      if (tcp_src != 0)
+      {
+        socketIn.update(&tcp_src, &fid);
+      }
     }
     else
     {
       fstat->size += bpf_ntohs(iph->tot_len);
-    }
-
-    u16 tcp_src = ntohs(tcph->source);
-
-    if (tcp_src != 0)
-    {
-      inPorts.update(&tcp_src, &fid);
     }
 
     return XDP_PASS;
@@ -273,6 +293,7 @@ int handle_egress(struct __sk_buff *skb)
       struct flowStat newStat;
       newStat.size = bpf_ntohs(iph->tot_len);
       newStat.arrival = bpf_ktime_get_ns();
+      newStat.dir = OUTGOING;
       flowStats.insert(&fid, &newStat);
     }
     else
@@ -281,7 +302,7 @@ int handle_egress(struct __sk_buff *skb)
     }
 
     u16 sport = ntohs(tcph->source);
-    in_fid = outPorts.lookup(&sport);
+    in_fid = socketOut.lookup(&sport);
 
     if (in_fid != 0)
     {
@@ -289,9 +310,11 @@ int handle_egress(struct __sk_buff *skb)
       struct flowStat *curr_stats = flowStats.lookup(&fid);
 
       if (in_stats != NULL && curr_stats != NULL &&
+          curr_stats->dir == OUTGOING && in_stats->dir == INCOMING &&
           in_fid->address != fid.address &&
-          in_stats->arrival > curr_stats->arrival - 1000000000 &&
-          abs(in_stats->size - curr_stats->size) < 6500)
+          in_stats->arrival > curr_stats->arrival - TIME_NS &&
+          in_stats->arrival < curr_stats->arrival &&
+          abs(in_stats->size - curr_stats->size) < SIZE_B)
       {
         struct data_out data = {};
 
@@ -308,7 +331,6 @@ int handle_egress(struct __sk_buff *skb)
         data.res_tm = curr_stats->arrival;
 
         output.ringbuf_output(&data, sizeof(data), 0);
-        // bpf_trace_printk("Instigator ID: %u, %u, %u", in_fid->address, in_fid->port, in_fid->proto);
       }
     }
 
